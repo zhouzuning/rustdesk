@@ -10,11 +10,16 @@ env:
   FLUTTER_VERSION: "3.24.5"
   ANDROID_FLUTTER_VERSION: "3.24.5"
   RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  SCITER_NASM_DEBVERSION: "2.15.05-1"
+  LLVM_VERSION: "15.0.6"
   VERSION: "1.4.6"
   NDK_VERSION: "r28c"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   UPLOAD_ARTIFACT: "true"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   generate-bridge:
@@ -22,12 +27,23 @@ jobs:
 
   build-android:
     needs: [generate-bridge]
-    name: Build Android APK
+    name: Build Android APK ${{ matrix.job.target }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        arch: [aarch64, armv7, x86_64]
+        job:
+          - {
+              target: aarch64-linux-android,
+              arch: aarch64,
+              arch_dir: arm64-v8a,
+            }
+          - {
+              target: armv7-linux-androideabi,
+              arch: armv7,
+              arch_dir: armeabi-v7a,
+            }
+          - { target: x86_64-linux-android, arch: x86_64, arch_dir: x86_64 }
     steps:
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
@@ -39,6 +55,13 @@ jobs:
           large-packages: false
           docker-images: true
           swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -52,33 +75,39 @@ jobs:
                clang cmake curl git g++ g++-multilib \
                libc6-dev libclang-dev libunwind-dev \
                ninja-build openjdk-17-jdk-headless \
-               pkg-config wget
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
-      - uses: Swatinem/rust-cache@v2
+               pkg-config wget nasm
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: /vcpkg
+          vcpkgDirectory: /opt/artifacts/vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
 
       - name: Install vcpkg dependencies
         run: |
-          if ! /vcpkg/vcpkg install; then
-            find /vcpkg/buildtrees/ -name "*.log" | head -5 | xargs cat 2>/dev/null || true
+          case ${{ matrix.job.target }} in
+            aarch64-linux-android)
+              ANDROID_TARGET=arm64-v8a
+            ;;
+            armv7-linux-androideabi)
+              ANDROID_TARGET=armeabi-v7a
+            ;;
+            x86_64-linux-android)
+              ANDROID_TARGET=x86_64
+            ;;
+          esac
+          if ! ./flutter/build_android_deps.sh "${ANDROID_TARGET}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
             exit 1
           fi
-
-      - name: Install Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: "stable"
-          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+        shell: bash
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -86,33 +115,78 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      - name: Build librustdesk
-        run: |
-          cd flutter
-          cargo ndk -N ${{ env.NDK_VERSION }} -t ${{ matrix.arch }} -- build --release
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
 
-      - name: Copy native library
-        run: |
-          LIB_DIR=flutter/android/app/src/main/jniLibs/${{ matrix.arch == 'aarch64' && 'arm64-v8a' || matrix.arch == 'armv7' && 'armeabi-v7a' || 'x86_64' }}
-          mkdir -p "$LIB_DIR"
-          cp target/${{ matrix.arch }}-linux-android/release/librustdesk.so "$LIB_DIR/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: ${{ matrix.job.target }}
 
-      - name: Build APK
+      - name: Build rustdesk lib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          rustup target add ${{ matrix.job.target }}
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          case ${{ matrix.job.target }} in
+            aarch64-linux-android)
+              ./flutter/ndk_arm64.sh
+              mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+            ;;
+            armv7-linux-androideabi)
+              ./flutter/ndk_arm.sh
+              mkdir -p ./flutter/android/app/src/main/jniLibs/armeabi-v7a
+              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+            ;;
+            x86_64-linux-android)
+              ./flutter/ndk_x64.sh
+              mkdir -p ./flutter/android/app/src/main/jniLibs/x86_64
+              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+            ;;
+          esac
+
+      - name: Upload Rustdesk library to Artifacts
+        uses: actions/upload-artifact@master
+        with:
+          name: librustdesk.so.${{ matrix.job.target }}
+          path: ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Build rustdesk
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
           cd flutter
-          flutter build apk --release --target-platform android-${{ matrix.arch }}
+          flutter build apk --${{ 'release' }} --target-platform android-${{ matrix.job.arch }}
 
       - name: Prepare APK
         run: |
           mkdir -p signed-apk
-          mv flutter/build/app/outputs/flutter-apk/app-release.apk signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.apk
+          mv flutter/build/app/outputs/flutter-apk/app-release.apk signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
 
       - name: Setup Android SDK build-tools
         shell: bash
         run: |
           BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
           echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
-          echo "Build tools version: $BUILD_TOOL_VERSION"
 
       - name: Sign APK
         if: env.ANDROID_SIGNING_KEY != null
@@ -127,18 +201,53 @@ jobs:
           BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
 
       - name: Upload APK
+        if: env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@master
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.apk
-          path: signed-apk/*.apk
+          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          path: ${{ env.ANDROID_SIGNING_KEY != null && 'signed-apk/*.apk' || 'signed-apk/*.apk' }}
 
   build-universal:
     needs: [build-android]
     name: Build Universal APK
     runs-on: ubuntu-24.04
+    if: env.UPLOAD_ARTIFACT == 'true'
+    env:
+      reltype: release
+      x86_target: ""
+      suffix: ""
     steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl git g++ g++-multilib \
+               libc6-dev libclang-dev libunwind-dev \
+               ninja-build openjdk-17-jdk-headless \
+               pkg-config wget nasm
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
@@ -146,20 +255,69 @@ jobs:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
 
-      - name: Download native libraries
+      - name: Patch Flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Download Artifacts
         uses: actions/download-artifact@master
         with:
-          path: ./flutter/android/app/src/main/jniLibs
-          pattern: rustdesk-*
-          merge-multiple: true
+          path: ./
+          name: bridge-artifact
+
+      - name: Download Rustdesk library from Artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: librustdesk.so.aarch64-linux-android
+          path: ./flutter/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Download Rustdesk library from Artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: librustdesk.so.armv7-linux-androideabi
+          path: ./flutter/android/app/src/main/jniLibs/armeabi-v7a
+
+      - name: Download Rustdesk library from Artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: librustdesk.so.x86_64-linux-android
+          path: ./flutter/android/app/src/main/jniLibs/x86_64
 
       - name: Build Universal APK
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
           cd flutter
-          flutter build apk --release --target-platform android-arm64,android-arm,android-x64
+          flutter build apk --${{ env.reltype }} --target-platform android-arm64,android-arm,android-x64${{ env.x86_target }}
+
+      - name: Prepare APK
+        run: |
+          mkdir -p signed-apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-${{ env.reltype }}.apk signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
+
+      - name: Setup Android SDK build-tools
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+
+      - name: Sign APK
+        if: env.ANDROID_SIGNING_KEY != null
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
 
       - name: Upload Universal APK
         uses: actions/upload-artifact@master
         with:
           name: rustdesk-${{ env.VERSION }}-universal.apk
-          path: flutter/build/app/outputs/flutter-apk/app-release.apk
+          path: signed-apk/rustdesk-${{ env.VERSION }}-universal.apk
