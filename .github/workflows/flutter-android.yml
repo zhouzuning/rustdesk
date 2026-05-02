@@ -1,0 +1,165 @@
+name: Android CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  VERSION: "1.4.6"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
+  UPLOAD_ARTIFACT: "true"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-android:
+    needs: [generate-bridge]
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, armv7, x86_64]
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl git g++ g++-multilib \
+               libc6-dev libclang-dev libunwind-dev \
+               ninja-build openjdk-17-jdk-headless \
+               pkg-config wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! /vcpkg/vcpkg install; then
+            find /vcpkg/buildtrees/ -name "*.log" | head -5 | xargs cat 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Build librustdesk
+        run: |
+          cd flutter
+          cargo ndk -N ${{ env.NDK_VERSION }} -t ${{ matrix.arch }} -- build --release
+
+      - name: Copy native library
+        run: |
+          LIB_DIR=flutter/android/app/src/main/jniLibs/${{ matrix.arch == 'aarch64' && 'arm64-v8a' || matrix.arch == 'armv7' && 'armeabi-v7a' || 'x86_64' }}
+          mkdir -p "$LIB_DIR"
+          cp target/${{ matrix.arch }}-linux-android/release/librustdesk.so "$LIB_DIR/"
+
+      - name: Build APK
+        run: |
+          cd flutter
+          flutter build apk --release --target-platform android-${{ matrix.arch }}
+
+      - name: Prepare APK
+        run: |
+          mkdir -p signed-apk
+          mv flutter/build/app/outputs/flutter-apk/app-release.apk signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.apk
+
+      - name: Setup Android SDK build-tools
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+          echo "Build tools version: $BUILD_TOOL_VERSION"
+
+      - name: Sign APK
+        if: env.ANDROID_SIGNING_KEY != null
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.apk
+          path: signed-apk/*.apk
+
+  build-universal:
+    needs: [build-android]
+    name: Build Universal APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Download native libraries
+        uses: actions/download-artifact@master
+        with:
+          path: ./flutter/android/app/src/main/jniLibs
+          pattern: rustdesk-*
+          merge-multiple: true
+
+      - name: Build Universal APK
+        run: |
+          cd flutter
+          flutter build apk --release --target-platform android-arm64,android-arm,android-x64
+
+      - name: Upload Universal APK
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-${{ env.VERSION }}-universal.apk
+          path: flutter/build/app/outputs/flutter-apk/app-release.apk
